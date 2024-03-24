@@ -1,0 +1,2 @@
+- Discover plat prefix via DNS64 as described in RFC 7050.
+- Convert IPv4 to IPv6 as described in RFC 6145.

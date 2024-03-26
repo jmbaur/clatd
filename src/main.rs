@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::str::FromStr;
 
+use etherparse::{icmpv4, icmpv6, Icmpv4Slice, Icmpv4Type, Icmpv6Header, Icmpv6Slice, Icmpv6Type};
 use serde::Deserialize;
 
 use crate::tun::Tun;
@@ -127,15 +128,28 @@ fn main() -> anyhow::Result<()> {
                             let mut out = Vec::<u8>::with_capacity(
                                 etherparse::Ipv6Header::LEN + payload.len(),
                             );
-                            let v6_header = convert_ip_header(
-                                &config,
-                                &header,
-                                &v6_source_addr,
-                                &v6_dest_addr,
-                            )?;
-                            v6_header.write(&mut out)?;
-                            out.write_all(payload)?;
-                            tun_dev.write_all(&out)?;
+
+                            let payload = match dbg!(etherparse::Icmpv4Slice::from_slice(payload)) {
+                                Ok(icmpv4) => {
+                                    let icmpv6 = convert_icmp(icmpv4);
+                                    icmpv6.map(|icmpv6| icmpv6.slice())
+                                }
+                                _ => Some(payload),
+                            };
+
+                            if let Some(payload) = payload {
+                                let v6_header = convert_ip_header(
+                                    &config,
+                                    &header,
+                                    &v6_source_addr,
+                                    &v6_dest_addr,
+                                )?;
+                                v6_header.write(&mut out)?;
+                                out.write_all(payload)?;
+                                tun_dev.write_all(&out)?;
+                            } else {
+                                // silently drop
+                            }
                         }
                     }
                     Err(e) => {
@@ -172,6 +186,64 @@ fn convert_ip_header(
     };
 
     Ok(v6_header)
+}
+
+fn convert_icmp(icmpv4_slice: Icmpv4Slice<'_>) -> Option<Icmpv6Slice<'_>> {
+    let _icmpv6_header = match icmpv4_slice.header().icmp_type {
+        Icmpv4Type::EchoRequest(_) => todo!(),
+        Icmpv4Type::EchoReply(_) => todo!(),
+        Icmpv4Type::DestinationUnreachable(v4_dest_unreachable) => {
+            let v6_dest_unreachable = match v4_dest_unreachable {
+                icmpv4::DestUnreachableHeader::Network
+                | icmpv4::DestUnreachableHeader::Host
+                | icmpv4::DestUnreachableHeader::NetworkUnknown
+                | icmpv4::DestUnreachableHeader::HostUnknown
+                | icmpv4::DestUnreachableHeader::Isolated
+                | icmpv4::DestUnreachableHeader::SourceRouteFailed
+                | icmpv4::DestUnreachableHeader::TosNetwork
+                | icmpv4::DestUnreachableHeader::TosHost => icmpv6::DestUnreachableCode::NoRoute,
+                icmpv4::DestUnreachableHeader::Protocol => todo!(),
+                icmpv4::DestUnreachableHeader::Port => icmpv6::DestUnreachableCode::Port,
+                icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu } => todo!(),
+                icmpv4::DestUnreachableHeader::NetworkProhibited
+                | icmpv4::DestUnreachableHeader::HostProhibited
+                | icmpv4::DestUnreachableHeader::FilterProhibited
+                | icmpv4::DestUnreachableHeader::PrecedenceCutoff => {
+                    icmpv6::DestUnreachableCode::Prohibited
+                }
+                _ => return None,
+            };
+            let header = Icmpv6Header::new(Icmpv6Type::DestinationUnreachable(v6_dest_unreachable));
+            header
+        }
+        Icmpv4Type::TimeExceeded(time_exceeded_code) => {
+            Icmpv6Header::new(Icmpv6Type::TimeExceeded(match time_exceeded_code {
+                icmpv4::TimeExceededCode::TtlExceededInTransit => {
+                    icmpv6::TimeExceededCode::HopLimitExceeded
+                }
+                icmpv4::TimeExceededCode::FragmentReassemblyTimeExceeded => {
+                    icmpv6::TimeExceededCode::FragmentReassemblyTimeExceeded
+                }
+            }))
+        }
+        Icmpv4Type::ParameterProblem(v4_parameter_problem) => Icmpv6Header::new(
+            Icmpv6Type::ParameterProblem(icmpv6::ParameterProblemHeader {
+                code: match v4_parameter_problem {
+                    icmpv4::ParameterProblemHeader::PointerIndicatesError(_) => {
+                        icmpv6::ParameterProblemCode::ErroneousHeaderField
+                    }
+                    icmpv4::ParameterProblemHeader::BadLength => {
+                        icmpv6::ParameterProblemCode::ErroneousHeaderField
+                    }
+                    icmpv4::ParameterProblemHeader::MissingRequiredOption => return None,
+                },
+                pointer: todo!(),
+            }),
+        ),
+        _ => return None,
+    };
+
+    None
 }
 
 // TODO(jared): mask plat prefix address with plat prefix length

@@ -2,7 +2,10 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::str::FromStr;
 
-use etherparse::{icmpv4, icmpv6, Icmpv4Slice, Icmpv4Type, Icmpv6Header, Icmpv6Slice, Icmpv6Type};
+use etherparse::{
+    icmpv4, icmpv6, Icmpv4Header, Icmpv4Slice, Icmpv4Type, Icmpv6Header, Icmpv6Slice, Icmpv6Type,
+    IpNumber,
+};
 use serde::Deserialize;
 
 use crate::tun::Tun;
@@ -93,8 +96,6 @@ fn discover_plat_prefix() -> anyhow::Result<Option<(Ipv6Addr, usize)>> {
 }
 
 fn main() -> anyhow::Result<()> {
-    // println!("{}", bindings::TUNSETIFF);
-
     let config = if false {
         Config::load_from_file("/tmp/clatd-config.toml")?
     } else {
@@ -137,6 +138,7 @@ fn main() -> anyhow::Result<()> {
                                 _ => Some(payload),
                             };
 
+                            // If payload is None, we silently drop the packet
                             if let Some(payload) = payload {
                                 let v6_header = convert_ip_header(
                                     &config,
@@ -147,8 +149,6 @@ fn main() -> anyhow::Result<()> {
                                 v6_header.write(&mut out)?;
                                 out.write_all(payload)?;
                                 tun_dev.write_all(&out)?;
-                            } else {
-                                // silently drop
                             }
                         }
                     }
@@ -177,12 +177,16 @@ fn convert_ip_header(
         flow_label: etherparse::Ipv6FlowLabel::ZERO,
         payload_length: v4_header.payload_len()? - v4_header.slice().len() as u16,
         hop_limit: v4_header.ttl(),
+        next_header: if v4_header.protocol() == IpNumber::ICMP {
+            IpNumber::IPV6_ICMP
+        } else {
+            v4_header.protocol()
+        },
         traffic_class: if config.ignore_ipv4_tos {
             0
         } else {
             v4_header.dcp().value()
         },
-        ..Default::default()
     };
 
     Ok(v6_header)
@@ -190,10 +194,12 @@ fn convert_ip_header(
 
 fn convert_icmp(icmpv4_slice: Icmpv4Slice<'_>) -> Option<Icmpv6Slice<'_>> {
     let _icmpv6_header = match icmpv4_slice.header().icmp_type {
-        Icmpv4Type::EchoRequest(_) => todo!(),
-        Icmpv4Type::EchoReply(_) => todo!(),
+        Icmpv4Type::EchoRequest(echo_header) => {
+            Icmpv6Header::new(Icmpv6Type::EchoRequest(echo_header))
+        }
+        Icmpv4Type::EchoReply(echo_header) => Icmpv6Header::new(Icmpv6Type::EchoReply(echo_header)),
         Icmpv4Type::DestinationUnreachable(v4_dest_unreachable) => {
-            let v6_dest_unreachable = match v4_dest_unreachable {
+            let icmpv6_type = match v4_dest_unreachable {
                 icmpv4::DestUnreachableHeader::Network
                 | icmpv4::DestUnreachableHeader::Host
                 | icmpv4::DestUnreachableHeader::NetworkUnknown
@@ -201,19 +207,33 @@ fn convert_icmp(icmpv4_slice: Icmpv4Slice<'_>) -> Option<Icmpv6Slice<'_>> {
                 | icmpv4::DestUnreachableHeader::Isolated
                 | icmpv4::DestUnreachableHeader::SourceRouteFailed
                 | icmpv4::DestUnreachableHeader::TosNetwork
-                | icmpv4::DestUnreachableHeader::TosHost => icmpv6::DestUnreachableCode::NoRoute,
-                icmpv4::DestUnreachableHeader::Protocol => todo!(),
-                icmpv4::DestUnreachableHeader::Port => icmpv6::DestUnreachableCode::Port,
-                icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu } => todo!(),
+                | icmpv4::DestUnreachableHeader::TosHost => {
+                    Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::NoRoute)
+                }
+                icmpv4::DestUnreachableHeader::Protocol => {
+                    Icmpv6Type::ParameterProblem(dbg!(icmpv6::ParameterProblemHeader {
+                        code: icmpv6::ParameterProblemCode::UnrecognizedNextHeader,
+                        pointer: 0, // TODO(jared): need to modify this
+                    }))
+                }
+                icmpv4::DestUnreachableHeader::Port => {
+                    Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::Port)
+                }
+                icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu } => {
+                    Icmpv6Type::PacketTooBig {
+                        mtu: next_hop_mtu as u32
+                            + (Icmpv6Header::MAX_LEN as u32 - Icmpv4Header::MAX_LEN as u32),
+                    }
+                }
                 icmpv4::DestUnreachableHeader::NetworkProhibited
                 | icmpv4::DestUnreachableHeader::HostProhibited
                 | icmpv4::DestUnreachableHeader::FilterProhibited
                 | icmpv4::DestUnreachableHeader::PrecedenceCutoff => {
-                    icmpv6::DestUnreachableCode::Prohibited
+                    Icmpv6Type::DestinationUnreachable(icmpv6::DestUnreachableCode::Prohibited)
                 }
                 _ => return None,
             };
-            let header = Icmpv6Header::new(Icmpv6Type::DestinationUnreachable(v6_dest_unreachable));
+            let header = Icmpv6Header::new(icmpv6_type);
             header
         }
         Icmpv4Type::TimeExceeded(time_exceeded_code) => {
@@ -227,7 +247,7 @@ fn convert_icmp(icmpv4_slice: Icmpv4Slice<'_>) -> Option<Icmpv6Slice<'_>> {
             }))
         }
         Icmpv4Type::ParameterProblem(v4_parameter_problem) => Icmpv6Header::new(
-            Icmpv6Type::ParameterProblem(icmpv6::ParameterProblemHeader {
+            Icmpv6Type::ParameterProblem(dbg!(icmpv6::ParameterProblemHeader {
                 code: match v4_parameter_problem {
                     icmpv4::ParameterProblemHeader::PointerIndicatesError(_) => {
                         icmpv6::ParameterProblemCode::ErroneousHeaderField
@@ -237,8 +257,8 @@ fn convert_icmp(icmpv4_slice: Icmpv4Slice<'_>) -> Option<Icmpv6Slice<'_>> {
                     }
                     icmpv4::ParameterProblemHeader::MissingRequiredOption => return None,
                 },
-                pointer: todo!(),
-            }),
+                pointer: 0, // TODO(jared): need to modify this
+            })),
         ),
         _ => return None,
     };

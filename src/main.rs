@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use clap::Parser;
 use etherparse::{
     icmpv4, icmpv6, Icmpv4Header, Icmpv4Slice, Icmpv4Type, Icmpv6Header, Icmpv6Slice, Icmpv6Type,
     IpNumber,
@@ -22,13 +24,13 @@ pub(crate) mod bindings {
 // TODO(jared): find constant for this in linux source
 const MAX_PACKET_SIZE: usize = (1 << 16) - 1;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Config {
     ignore_ipv4_tos: bool,
 }
 
 impl Config {
-    pub fn load_from_file(file: &str) -> anyhow::Result<Self> {
+    pub fn load_from_file(file: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(file)?;
         Ok(toml::from_str(&contents)?)
     }
@@ -40,6 +42,13 @@ impl Default for Config {
             ignore_ipv4_tos: false,
         }
     }
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 }
 
 // TODO(jared): use actual NDP messages to discover plat prefix instead of using DNS results from
@@ -96,16 +105,21 @@ fn discover_plat_prefix() -> anyhow::Result<Option<(Ipv6Addr, usize)>> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let config = if false {
-        Config::load_from_file("/tmp/clatd-config.toml")?
+    let args = Args::parse();
+
+    let config = if let Some(config) = args.config {
+        Config::load_from_file(&config.canonicalize()?)?
     } else {
         Config::default()
     };
 
+    eprintln!("{:#?}", config);
+
     loop {
         if let Some((plat_prefix_addr, plat_prefix_length)) = discover_plat_prefix()? {
-            let mut tun_dev = Tun::new("clat");
-            tun_dev.open()?;
+            let mut tun_dev = Tun::open("clat")?;
+
+            setup_tun_device(&tun_dev.name)?;
 
             loop {
                 let mut buf = [0u8; MAX_PACKET_SIZE];
@@ -162,6 +176,13 @@ fn main() -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(60 * 10));
         }
     }
+}
+
+fn setup_tun_device(_name: &str) -> anyhow::Result<()> {
+    let (_conn, _handle, _) = rtnetlink::new_connection()?;
+    // let mut links = handle.link().get().match_name(name.to_string()).execute();
+    // links
+    Ok(())
 }
 
 /// Convert an IPv4 header to an IPv6 header as specified in RFC 6145 Section 4.1.
